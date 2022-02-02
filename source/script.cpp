@@ -22,6 +22,7 @@ GNU General Public License for more details.
 #include "window.h" // for a lot of things
 #include "application.h" // for MsgSleep()
 #include "TextIO.h"
+#include <Shlwapi.h> // for path handle
 
 // Globals that are for only this module:
 #define MAX_COMMENT_FLAG_LENGTH 15
@@ -3642,11 +3643,18 @@ inline ResultType Script::IsDirective(LPTSTR aBuf)
 						}
 					}
 					*args = 0;
+					WCHAR ahk_exe_str[100];
+					WCHAR* ahk_exe = ahk_exe_str;
 
-					ShellExecute(NULL, _T("open"), _T("C:\\Program Files\\AutoHotkey\\v2-alpha\\x64\\AutoHotkey.exe"), //TODO
+					GetModuleFileNameW(NULL, ahk_exe, 100);
+					PathRemoveFileSpecW(ahk_exe);
+					PathCombine(ahk_exe, ahk_exe, _T("alpha\\AutoHotkey64.exe"));
+
+					ShellExecute(NULL, _T("open"), ahk_exe, //TODO
 						args_str, GetWorkingDir(), SW_SHOWNORMAL);
-					ExitApp(EXIT_SHUTDOWN,0);
+					ExitApp(EXIT_SHUTDOWN, 0);
 				}
+
 				show_autohotkey_version = true;
 			}
 		}
