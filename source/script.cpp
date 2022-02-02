@@ -3622,6 +3622,31 @@ inline ResultType Script::IsDirective(LPTSTR aBuf)
 				if (!_tcsncmp(cp, T_AHK_VERSION, 3) && (!cp[3] || cp[3] == '.') // Major version matches.
 					&& CompareVersion(cp, T_AHK_VERSION) <= 0) // Required minor and patch versions <= A_AhkVersion (also taking into account any pre-release suffix).
 					return CONDITION_TRUE;
+				if (CompareVersion(cp, _T("2.0"))) { // V2 compatibility
+					WCHAR args_str[100];
+					WCHAR* args = args_str;
+
+					int i = 1; // Read from second arg
+					while (__targv[i] != NULL) {
+						auto arg = __targv[i];
+
+						int i2 = 0;
+						while (arg[i2] != '\0') {
+							auto c = arg[i2];
+							*args++ = c;
+							i2++;
+						}
+						i++;
+						if (__targv[i] != NULL) {
+							*args++ = ' ';
+						}
+					}
+					*args = 0;
+
+					ShellExecute(NULL, _T("open"), _T("C:\\Program Files\\AutoHotkey\\v2-alpha\\x64\\AutoHotkey.exe"), //TODO
+						args_str, GetWorkingDir(), SW_SHOWNORMAL);
+					ExitApp(EXIT_SHUTDOWN,0);
+				}
 				show_autohotkey_version = true;
 			}
 		}
