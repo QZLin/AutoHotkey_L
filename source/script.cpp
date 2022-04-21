@@ -249,7 +249,7 @@ Script::Script()
 	, mCurrFileIndex(0), mCombinedLineNumber(0), mNoHotkeyLabels(true), mMenuUseErrorLevel(false)
 	, mFileSpec(_T("")), mFileDir(_T("")), mFileName(_T("")), mOurEXE(_T("")), mOurEXEDir(_T("")), mMainWindowTitle(_T(""))
 	, mIsReadyToExecute(false), mAutoExecSectionIsRunning(false)
-	, mIsRestart(false), mErrorStdOut(false), mErrorStdOutCP(-1)
+	, mIsRestart(false), mErrorStdOut(false), mErrorStdOutCP(0)
 #ifndef AUTOHOTKEYSC
 	, mIncludeLibraryFunctionsThenExit(NULL)
 #endif
@@ -3549,7 +3549,7 @@ inline ResultType Script::IsDirective(LPTSTR aBuf)
 
 		int i;
 
-		static LPTSTR sWarnTypes[] = { WARN_TYPE_STRINGS };
+		static const LPCTSTR sWarnTypes[] = { WARN_TYPE_STRINGS };
 		WarnType warnType = WARN_ALL; // Set default.
 		if (*parameter)
 		{
@@ -3563,7 +3563,7 @@ inline ResultType Script::IsDirective(LPTSTR aBuf)
 			warnType = (WarnType)i;
 		}
 
-		static LPTSTR sWarnModes[] = { WARN_MODE_STRINGS };
+		static const LPCTSTR sWarnModes[] = { WARN_MODE_STRINGS };
 		WarnMode warnMode = WARNMODE_MSGBOX; // Set default.
 		if (*param2)
 		{
@@ -3781,7 +3781,8 @@ void Script::DeleteTimer(IObject *aLabel)
 			// Disable it, even if it's not technically being deleted yet.
 			if (timer->mEnabled)
 				timer->Disable(); // Keeps track of mTimerEnabledCount and whether the main timer is needed.
-			if (timer->mExistingThreads) // This condition differs from g->CurrentTimer == timer, which only detects the "top-most" timer.
+			if (timer->mExistingThreads // This condition differs from g->CurrentTimer == timer, which only detects the "top-most" timer.
+				|| timer->mDeleteLocked)
 			{
 				if (!aLabel) // Caller requested we delete a previously marked timer which
 					continue; // has now finished, but this one hasn't, so keep looking.
