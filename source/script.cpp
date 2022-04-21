@@ -3648,7 +3648,7 @@ inline ResultType Script::IsDirective(LPTSTR aBuf)
 
 					GetModuleFileNameW(NULL, ahk_exe, 100);
 					PathRemoveFileSpecW(ahk_exe);
-					PathCombine(ahk_exe, ahk_exe, _T("alpha\\AutoHotkey64.exe"));
+					PathCombine(ahk_exe, ahk_exe, _T("v2-beta\\AutoHotkey64.exe"));
 
 					ShellExecute(NULL, _T("open"), ahk_exe, //TODO
 						args_str, GetWorkingDir(), SW_SHOWNORMAL);
