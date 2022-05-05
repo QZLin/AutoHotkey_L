@@ -198,7 +198,7 @@ ResultType YYYYMMDDToSystemTime(LPTSTR aYYYYMMDD, SYSTEMTIME &aSystemTime, bool 
 	else // Month is in-range, which is necessary for the method below to work safely.
 	{
 		// Day-of-week code by Tomohiko Sakamoto:
-		static int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+		static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
 		int y = aSystemTime.wYear;
 		y -= aSystemTime.wMonth < 3;
 		aSystemTime.wDayOfWeek = (y + y/4 - y/100 + y/400 + t[aSystemTime.wMonth-1] + aSystemTime.wDay) % 7;
@@ -1644,24 +1644,8 @@ void CoordToScreen(POINT &aPoint, int aWhichMode)
 
 
 
-void GetVirtualDesktopRect(RECT &aRect)
-{
-	aRect.right = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-	if (aRect.right) // A non-zero value indicates the OS supports multiple monitors or at least SM_CXVIRTUALSCREEN.
-	{
-		aRect.left = GetSystemMetrics(SM_XVIRTUALSCREEN);  // Might be negative or greater than zero.
-		aRect.right += aRect.left;
-		aRect.top = GetSystemMetrics(SM_YVIRTUALSCREEN);   // Might be negative or greater than zero.
-		aRect.bottom = aRect.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
-	}
-	else // Win95/NT do not support SM_CXVIRTUALSCREEN and such, so zero was returned.
-		GetWindowRect(GetDesktopWindow(), &aRect);
-}
-
-
-
 DWORD GetEnvVarReliable(LPCTSTR aEnvVarName, LPTSTR aBuf)
-// Returns the length of what has been copied into aBuf.
+// Returns the length of what has been copied into aBuf, not including the null terminator.
 // Caller has ensured that aBuf is large enough (though anything >=32767 is always large enough).
 // This function was added in v1.0.46.08 to fix a long-standing bug that was more fully revealed
 // by 1.0.46.07's reduction of DEREF_BUF_EXPAND_INCREMENT from 32 to 16K (which allowed the Win9x
@@ -1684,13 +1668,16 @@ DWORD GetEnvVarReliable(LPCTSTR aEnvVarName, LPTSTR aBuf)
 	//
 	// Don't use a size greater than 32767 because that will cause it to fail on Win95 (tested by Robert Yalkin).
 	// According to MSDN, 32767 is exactly large enough to handle the largest variable plus its zero terminator.
+	// Update in 2022: Testing on Windows 11 showed the actual limit to be much higher, perhaps only bounded by
+	// available memory.  Since this function is only used by A_ComSpec and the deprecated auto-env retrieval
+	// mechanism (and due to rarity of need), no attempt is made to support larger variables.
 	TCHAR buf[32767];
 	DWORD length = GetEnvironmentVariable(aEnvVarName, buf, _countof(buf));
 	// GetEnvironmentVariable() could be called twice, the first time to get the actual size.  But that would
 	// probably perform worse since GetEnvironmentVariable() is a very slow function.  In addition, it would
 	// add code complexity, so it seems best to fetch it into a large buffer then just copy it to dest-var.
-	if (length) // Probably always true under the conditions in effect for our callers.
-		tmemcpy(aBuf, buf, length + 1); // memcpy() usually benches a little faster than strcpy().
+	if (length && (size_t) length + 1 <= _countof(buf))
+		tmemcpy(aBuf, buf, (size_t) length + 1); // memcpy() usually benches a little faster than strcpy().
 	else // Failure. The buffer's contents might be undefined in this case.
 		*aBuf = '\0'; // Caller's buf should always have room for an empty string. So make it empty for maintainability, even if not strictly required by caller.
 	return length;
@@ -1833,6 +1820,24 @@ void FreeInterProcMem(HANDLE aHandle, LPVOID aMem)
 {
 	VirtualFreeEx(aHandle, aMem, 0, MEM_RELEASE); // Size 0 is used with MEM_RELEASE.
 	CloseHandle(aHandle);
+}
+
+
+
+// Returns true if a tooltip created by ToolTip already has the given text.
+// MUST NOT call on Windows XP or earlier, due to limitations of TTM_GETTEXT there.
+bool ToolTipTextEquals(HWND aToolTipHwnd, LPCTSTR aText)
+{
+	TOOLINFO ti;
+	ti.cbSize = sizeof(ti);
+	ti.hwnd = NULL;
+	ti.uId = 0;
+	size_t len = _tcslen(aText);
+	LPTSTR buf = ti.lpszText = (LPTSTR)_malloca((len + 2) * sizeof(TCHAR));
+	SendMessage(aToolTipHwnd, TTM_GETTEXT, len + 2, (LPARAM)&ti);
+	bool is_equal = !_tcscmp(aText, buf);
+	_freea(buf);
+	return is_equal;
 }
 
 
