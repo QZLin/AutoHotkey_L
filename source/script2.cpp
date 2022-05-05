@@ -738,10 +738,6 @@ ResultType Line::ToolTip(LPTSTR aText, LPTSTR aX, LPTSTR aY, LPTSTR aID)
 		return OK;
 	}
 
-	// Use virtual desktop so that tooltip can move onto non-primary monitor in a multi-monitor system:
-	RECT dtw;
-	GetVirtualDesktopRect(dtw);
-
 	bool one_or_both_coords_unspecified = !*aX || !*aY;
 	POINT pt, pt_cursor;
 	if (one_or_both_coords_unspecified)
@@ -770,6 +766,15 @@ ResultType Line::ToolTip(LPTSTR aText, LPTSTR aX, LPTSTR aY, LPTSTR aID)
 	if (*aY)
 		pt.y = ATOI(aY) + origin.y;
 
+	HMONITOR hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi;
+	mi.cbSize = sizeof(mi);
+	GetMonitorInfo(hmon, &mi);
+	// v1.1.34: Use work area to avoid trying to overlap the taskbar on newer OSes, which otherwise
+	// would cause the tooltip to appear at the top of the screen instead of the position we specify.
+	// This was observed on Windows 10 and 11, and confirmed to not apply to Windows 7 or XP.
+	RECT dtw = g_os.IsWin8orLater() ? mi.rcWork : mi.rcMonitor;
+
 	TOOLINFO ti = {0};
 	ti.cbSize = sizeof(ti) - sizeof(void *); // Fixed for v1.0.36.05: Tooltips fail to work on Windows 2000 unless the size for the *lpReserved member in _WIN32_WINNT 0x0501 is omitted.
 	ti.uFlags = TTF_TRACK;
@@ -792,16 +797,27 @@ ResultType Line::ToolTip(LPTSTR aText, LPTSTR aX, LPTSTR aY, LPTSTR aID)
 
 	// v1.0.40.12: Added the IsWindow() check below to recreate the tooltip in cases where it was destroyed
 	// by external means such as Alt-F4 or WinClose.
-	if (!tip_hwnd || !IsWindow(tip_hwnd))
+	bool newly_created = !tip_hwnd || !IsWindow(tip_hwnd);
+	if (newly_created)
 	{
 		// This this window has no owner, it won't be automatically destroyed when its owner is.
 		// Thus, it will be explicitly by the program's exit function.
 		tip_hwnd = g_hWndToolTip[window_index] = CreateWindowEx(WS_EX_TOPMOST, TOOLTIPS_CLASS, NULL, TTS_NOPREFIX | TTS_ALWAYSTIP
 			, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, NULL, NULL, NULL, NULL);
 		SendMessage(tip_hwnd, TTM_ADDTOOL, 0, (LPARAM)(LPTOOLINFO)&ti);
-		// v1.0.21: GetSystemMetrics(SM_CXSCREEN) is used for the maximum width because even on a
-		// multi-monitor system, most users would not want a tip window to stretch across multiple monitors:
-		SendMessage(tip_hwnd, TTM_SETMAXTIPWIDTH, 0, (LPARAM)GetSystemMetrics(SM_CXSCREEN));
+	}
+
+	// v1.1.34: Fixed to use the appropriate monitor, in case it's sized differently to the primary.
+	// Also fixed to account for incorrect DPI scaling done by the tooltip control; i.e. a value of
+	// n ends up allowing tooltips n*g_ScreenDPI/96 pixels wide.  TTM_SETMAXTIPWIDTH seems to want
+	// the max text width, not the max window width, so adjust for that.  Do this every time since
+	// the tooltip might be moving between screens of different sizes.
+	RECT text_rect = dtw;
+	SendMessage(tip_hwnd, TTM_ADJUSTRECT, FALSE, (LPARAM)&text_rect);
+	SendMessage(tip_hwnd, TTM_SETMAXTIPWIDTH, 0, (LPARAM)((text_rect.right - text_rect.left) * 96 / g_ScreenDPI));
+
+	if (newly_created)
+	{
 		// Must do these next two when the window is first created, otherwise GetWindowRect() below will retrieve
 		// a tooltip window size that is quite a bit taller than it winds up being:
 		SendMessage(tip_hwnd, TTM_TRACKPOSITION, 0, (LPARAM)MAKELONG(pt.x, pt.y));
@@ -813,7 +829,10 @@ ResultType Line::ToolTip(LPTSTR aText, LPTSTR aX, LPTSTR aY, LPTSTR aID)
 	// 1) Windows XP;
 	// 2) Common controls v6 (via manifest);
 	// 3) "Control Panel >> Display >> Effects >> Use transition >> Fade effect" setting is in effect.
-	SendMessage(tip_hwnd, TTM_UPDATETIPTEXT, 0, (LPARAM)&ti);
+	// v1.1.34: Avoid TTM_UPDATETIPTEXT if the text hasn't changed, to reduce flicker.  The behaviour described
+	// above could not be replicated, EVEN ON WINDOWS XP.  Whether it was ever observed on other OSes is unknown.
+	if (!newly_created && !ToolTipTextEquals(tip_hwnd, aText))
+		SendMessage(tip_hwnd, TTM_UPDATETIPTEXT, 0, (LPARAM)&ti);
 
 	RECT ttw = {0};
 	GetWindowRect(tip_hwnd, &ttw); // Must be called this late to ensure the tooltip has been created by above.
@@ -867,6 +886,10 @@ ResultType Line::ToolTip(LPTSTR aText, LPTSTR aX, LPTSTR aY, LPTSTR aID)
 		}
 	}
 
+	// These messages seem to cause a complete update of the tooltip, which is slow and causes flickering.
+	// It is tempting to use SetWindowPos() instead to speed things up, but if TTM_TRACKPOSITION isn't
+	// sent each time, the next TTM_UPDATETIPTEXT message will move it back to whatever position was set
+	// with TTM_TRACKPOSITION last.
 	SendMessage(tip_hwnd, TTM_TRACKPOSITION, 0, (LPARAM)MAKELONG(pt.x, pt.y));
 	// And do a TTM_TRACKACTIVATE even if the tooltip window already existed upon entry to this function,
 	// so that in case it was hidden or dismissed while its HWND still exists, it will be shown again:
@@ -5819,58 +5842,47 @@ LRESULT CALLBACK MainWindowProc(HWND hWnd, UINT iMsg, WPARAM wParam, LPARAM lPar
 
 
 
-bool FindAutoHotkeyUtilSub(LPTSTR aBuf, int aBufSize, LPTSTR aFile, LPTSTR aDir)
+bool FindAutoHotkeyUtilSub(LPTSTR aFile, LPTSTR aDir)
 {
-	int len = sntprintf(aBuf, aBufSize, _T("\"%s\\%s"), aDir, aFile);
-	if (len + 1 > aBufSize // Too long. Should realistically never happen.
-		|| GetFileAttributes(aBuf + 1) == INVALID_FILE_ATTRIBUTES) // File not found.
-		return false;
-	aBuf[len++] = '"';
-	aBuf[len] = '\0';
-	return true;
+	SetCurrentDirectory(aDir);
+	return GetFileAttributes(aFile) != INVALID_FILE_ATTRIBUTES;
 }
 
-bool FindAutoHotkeyUtil(LPTSTR aBuf, int aBufSize, LPTSTR aFile, LPTSTR aInstallDirBuf, LPTSTR &aUtilDir)
+bool FindAutoHotkeyUtil(LPTSTR aFile, bool &aFoundOurs)
 {
 	// Always try our directory first, in case it has different utils to the installed version.
-	// ActionExec()'s CreateProcess() is currently done in a way that prefers enclosing double quotes:
-	if (!FindAutoHotkeyUtilSub(aBuf, aBufSize, aFile, g_script.mOurEXEDir))
+	if (  !(aFoundOurs = FindAutoHotkeyUtilSub(aFile, g_script.mOurEXEDir))  )
 	{
 		// Try GetAHKInstallDir() so that compiled scripts running on machines that happen
 		// to have AHK installed will still be able to fetch the help file and Window Spy:
-		if (   !GetAHKInstallDir(aInstallDirBuf)
-			|| !FindAutoHotkeyUtilSub(aBuf, aBufSize, aFile, aInstallDirBuf)   )
+		TCHAR installdir[MAX_PATH];
+		if (   !GetAHKInstallDir(installdir)
+			|| !FindAutoHotkeyUtilSub(aFile, installdir)   )
 			return false;
-		aUtilDir = aInstallDirBuf;
 	}
-	else
-		aUtilDir = g_script.mOurEXEDir;
 	return true;
 }
 
 bool LaunchAutoHotkeyUtil(LPTSTR aFile, bool aIsScript)
 {
-	TCHAR buf_file[2048], buf_exe[2048], installdir[MAX_PATH];
-	LPTSTR utildir, file = buf_file, args = _T(""); // Use "" vs. NULL to specify that there are no params at all.
-	if (!FindAutoHotkeyUtil(buf_file, _countof(buf_file), aFile, installdir, utildir))
+	LPTSTR file = aFile, args = _T("");
+	bool our_file, result = false;
+	if (!FindAutoHotkeyUtil(aFile, our_file))
 		return false;
-	if (aIsScript)
-	{
-		// Always try AutoHotkey.exe in the same directory as the util first, if present,
-		// since mOurEXE could be a different version of AutoHotkey (or a compiled script).
-		if (FindAutoHotkeyUtilSub(buf_exe, _countof(buf_exe), _T("AutoHotkey.exe"), utildir))
-			file = buf_exe, args = buf_file;
 #ifndef AUTOHOTKEYSC
-		else if (utildir == g_script.mOurEXEDir)
-			// Use our EXE only if the util was found in our directory.
-			file = g_script.mOurEXE, args = buf_file;
-#endif
-		//else: AutoHotkey appears to be installed but missing AutoHotkey.exe.
-		// Try running the .ahk file directly in the off chance that it is registered
-		// with some other EXE name.
+	// If it's a script in our directory, use our EXE to run it.
+	TCHAR buf[64]; // More than enough for "/script WindowSpy.ahk".
+	if (aIsScript && our_file)
+	{
+		sntprintf(buf, _countof(buf), _T("/script %s"), aFile);
+		file = g_script.mOurEXE;
+		args = buf;
 	}
-	// Attempt to run the file:
-	return g_script.ActionExec(file, args, NULL, false) != FAIL;
+	//else it's not a script or it's the installed copy of WindowSpy.ahk, so just run it.
+#endif
+	result = g_script.ActionExec(file, args, NULL, false);
+	SetCurrentDirectory(g_WorkingDir); // Restore the proper working directory.
+	return result;
 }
 
 void LaunchWindowSpy()
@@ -6010,7 +6022,6 @@ ResultType ShowMainWindow(MainWindowModes aMode, bool aRestricted)
 	bool jump_to_bottom = false;  // Set default behavior for edit control.
 	static MainWindowModes current_mode = MAIN_MODE_NO_CHANGE;
 
-#ifdef AUTOHOTKEYSC
 	// If we were called from a restricted place, such as via the Tray Menu or the Main Menu,
 	// don't allow potentially sensitive info such as script lines and variables to be shown.
 	// This is done so that scripts can be compiled more securely, making it difficult for anyone
@@ -6027,7 +6038,6 @@ ResultType ShowMainWindow(MainWindowModes aMode, bool aRestricted)
 			_T("command option was not enabled in the original script."));
 		return OK;
 	}
-#endif
 
 	// If the window is empty, caller wants us to default it to showing the most recently
 	// executed script lines:
@@ -10333,14 +10343,21 @@ ResultType Line::FileInstall(LPTSTR aSource, LPTSTR aDest, LPTSTR aFlag)
 {
 	bool success;
 	bool allow_overwrite = (ATOI(aFlag) == 1);
-#ifdef AUTOHOTKEYSC
-	if (!allow_overwrite && Util_DoesFileExist(aDest))
-		return SetErrorLevelOrThrow();
+#ifndef AUTOHOTKEYSC
+	if (g_script.mKind != Script::ScriptKindResource)
+		success = FileInstallCopy(aSource, aDest, allow_overwrite);
+	else
+#endif
+		success = FileInstallExtract(aSource, aDest, allow_overwrite);
+	return SetErrorLevelOrThrowBool(!success);
+}
 
+bool Line::FileInstallExtract(LPTSTR aSource, LPTSTR aDest, bool aOverwrite)
+{
 	// Open the file first since it's the most likely to fail:
-	HANDLE hfile = CreateFile(aDest, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+	HANDLE hfile = CreateFile(aDest, GENERIC_WRITE, 0, NULL, aOverwrite ? CREATE_ALWAYS : CREATE_NEW, 0, NULL);
 	if (hfile == INVALID_HANDLE_VALUE)
-		return SetErrorLevelOrThrow();
+		return false;
 
 	// Create a temporary copy of aSource to ensure it is the correct case (upper-case).
 	// Ahk2Exe converts it to upper-case before adding the resource. My testing showed that
@@ -10358,6 +10375,7 @@ ResultType Line::FileInstall(LPTSTR aSource, LPTSTR aDest, LPTSTR aFlag)
 	HRSRC res;
 	HGLOBAL res_load;
 	LPVOID res_lock;
+	bool success = false;
 	if ( (res = FindResource(NULL, source, RT_RCDATA))
 	  && (res_load = LoadResource(NULL, res))
 	  && (res_lock = LockResource(res_load))  )
@@ -10366,25 +10384,24 @@ ResultType Line::FileInstall(LPTSTR aSource, LPTSTR aDest, LPTSTR aFlag)
 		// Write the resource data to file.
 		success = WriteFile(hfile, res_lock, SizeofResource(NULL, res), &num_bytes_written, NULL);
 	}
-	else
-		success = false;
 	CloseHandle(hfile);
+	return success;
+}
 
-#else // AUTOHOTKEYSC not defined:
-
+#ifndef AUTOHOTKEYSC
+bool Line::FileInstallCopy(LPTSTR aSource, LPTSTR aDest, bool aOverwrite)
+{
 	// v1.0.35.11: Must search in A_ScriptDir by default because that's where ahk2exe will search by default.
 	// The old behavior was to search in A_WorkingDir, which seems pointless because ahk2exe would never
 	// be able to use that value if the script changes it while running.
 	TCHAR aDestPath[T_MAX_PATH];
 	GetFullPathName(aDest, _countof(aDestPath), aDestPath, NULL);
 	SetCurrentDirectory(g_script.mFileDir);
-	success = CopyFile(aSource, aDestPath, !allow_overwrite);
+	bool success = CopyFile(aSource, aDestPath, !aOverwrite);
 	SetCurrentDirectory(g_WorkingDir); // Restore to proper value.
-
-#endif
-
-	return SetErrorLevelOrThrowBool(!success);
+	return success;
 }
+#endif
 
 
 
@@ -11278,14 +11295,7 @@ VarSizeType BIV_IsSuspended(LPTSTR aBuf, LPTSTR aVarName)
 
 VarSizeType BIV_IsCompiled(LPTSTR aBuf, LPTSTR aVarName)
 {
-#ifdef AUTOHOTKEYSC
-	if (aBuf)
-	{
-		*aBuf++ = '1';
-		*aBuf = '\0';
-	}
-	return 1;
-#else
+#ifndef AUTOHOTKEYSC
 	// v1.1.06: A_IsCompiled is defined so that it does not cause warnings with #Warn enabled,
 	// but left empty for backward-compatibility.  Defining the variable (even though it is
 	// left empty) has some side-effects:
@@ -11299,11 +11309,20 @@ VarSizeType BIV_IsCompiled(LPTSTR aBuf, LPTSTR aVarName)
 	//     (or the address of Var::sEmptyString if the variable hasn't been given a value).
 	//
 	//  3) A_IsCompiled will never show up in ListVars, even if the script is uncompiled.
-	//     
-	if (aBuf)
-		*aBuf = '\0';
-	return 0;
+	//
+	if (g_script.mKind != Script::ScriptKindResource)
+	{
+		if (aBuf)
+			*aBuf = '\0';
+		return 0;
+	}
 #endif
+	if (aBuf)
+	{
+		*aBuf++ = '1';
+		*aBuf = '\0';
+	}
+	return 1;
 }
 
 
