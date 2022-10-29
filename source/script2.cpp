@@ -9534,61 +9534,75 @@ ResultType Line::FileSelectFile(LPTSTR aOptions, LPTSTR aWorkingDir, LPTSTR aGre
 	TCHAR file_buf[65535];
 	*file_buf = '\0'; // Set default.
 
-	TCHAR working_dir[MAX_PATH]; // Using T_MAX_PATH vs. MAX_PATH did not help on Windows 10.0.16299 (see below).
-	if (!aWorkingDir || !*aWorkingDir)
-		*working_dir = '\0';
-	else
+	LPCTSTR initial_dir = NULL;
+	if (aWorkingDir && *aWorkingDir)
 	{
-		// Compress the path if possible to support longer paths.  Without this, any path longer
-		// than MAX_PATH would be ignored, presumably because the dialog, as part of the shell,
-		// does not support long paths.  Surprisingly, although Windows 10 long path awareness
-		// does not allow us to pass a long path for working_dir, it does affect whether the long
-		// path is used in the address bar and returned filenames.
-		if (_tcslen(aWorkingDir) >= MAX_PATH)
-			GetShortPathName(aWorkingDir, working_dir, _countof(working_dir));
-		else
-			tcslcpy(working_dir, aWorkingDir, _countof(working_dir));
+		LPCTSTR dir_and_name = aWorkingDir;
+		size_t dir_and_name_length = _tcslen(dir_and_name);
+		LPCTSTR last_backslash = _tcsrchr(dir_and_name, '\\');
 		// v1.0.43.10: Support CLSIDs such as:
 		//   My Computer  ::{20d04fe0-3aea-1069-a2d8-08002b30309d}
 		//   My Documents ::{450d8fba-ad25-11d0-98a8-0800361b1103}
 		// Also support optional subdirectory appended to the CLSID.
 		// Neither SetCurrentDirectory() nor GetFileAttributes() directly supports CLSIDs, so rely on other means
 		// to detect whether a CLSID ends in a directory vs. filename.
-		bool is_directory, is_clsid;
-		if (is_clsid = !_tcsncmp(working_dir, _T("::{"), 3))
+		bool is_directory = false; // Whether the entire dir_and_name is a directory, lacking a default filename.
+		if (last_backslash && !last_backslash[1])
+			is_directory = true; // The entire string is the directory; keep the slash to ensure "C:\" uses the root, not the working directory ("C:").
+		else if (!_tcsncmp(dir_and_name, _T("::{"), 3))
 		{
-			LPTSTR end_brace;
-			if (end_brace = _tcschr(working_dir, '}'))
-				is_directory = !end_brace[1] // First '}' is also the last char in string, so it's naked CLSID (so assume directory).
-					|| working_dir[_tcslen(working_dir) - 1] == '\\'; // Or path ends in backslash.
-			else // Badly formatted clsid.
-				is_directory = true; // Arbitrary default due to rarity.
+			// Do a rough check to determine whether this is likely to be a naked CLSID (examples above),
+			// in which case it should be treated as a directory with no default filename.  This should be
+			// more efficient than the previous approach of scanning for the first '}'.
+			// Interpretation of at least one partially invalid case differs from the previous method:
+			// 1) If the default filename ends with '}' and '}' is missing from the CLSID,
+			//     Old: the entire string is ignored because it looks like a CLSID, but is invalid.
+			//     New: there isn't a '}' at the right position, so the default filename is used.
+			// All other differences probably only affect invalid CLSIDs, with the old method being more
+			// likely to ignore the entire string, while the new method prefers to split at "\" if present.
+			is_directory = dir_and_name_length == 40 && dir_and_name[39] == '}' && !last_backslash;
 		}
-		else // Not a CLSID.
+		else // Not a CLSID and not explicitly a directory (no trailing backslash).
 		{
-			DWORD attr = GetFileAttributes(working_dir);
+			DWORD attr = GetFileAttributes(dir_and_name);
 			is_directory = (attr != 0xFFFFFFFF) && (attr & FILE_ATTRIBUTE_DIRECTORY);
 		}
-		if (!is_directory)
+		size_t initial_dir_length = 0;
+		if (is_directory)
+		{
+			// Use the entire dir_and_name as the initial directory.
+			initial_dir = dir_and_name;
+			initial_dir_length = dir_and_name_length;
+		}
+		else
 		{
 			// Above condition indicates it's either an existing file that's not a folder, or a nonexistent
 			// folder/filename.  In either case, it seems best to assume it's a file because the user may want
 			// to provide a default SAVE filename, and it would be normal for such a file not to already exist.
-			LPTSTR last_backslash;
-			if (last_backslash = _tcsrchr(working_dir, '\\'))
+			if (!last_backslash)
+			{
+				// Use the entire dir_and_name as the default filename.
+				tcslcpy(file_buf, dir_and_name, _countof(file_buf));
+			}
+			else
 			{
 				tcslcpy(file_buf, last_backslash + 1, _countof(file_buf)); // Set the default filename.
-				*last_backslash = '\0'; // Make the working directory just the file's path.
+				// Set the initial directory.
+				initial_dir = dir_and_name;
+				initial_dir_length = last_backslash - dir_and_name;
 			}
-			else // The entire working_dir string is the default file (unless this is a clsid).
-				if (!is_clsid)
-				{
-					tcslcpy(file_buf, working_dir, _countof(file_buf));
-					*working_dir = '\0';  // This signals it to use the default directory.
-				}
-				//else leave working_dir set to the entire clsid string in case it's somehow valid.
 		}
-		// else it is a directory, so just leave working_dir set as it was initially.
+		if (initial_dir && initial_dir[initial_dir_length]) // Null termination required.
+		{
+			if (initial_dir_length < T_MAX_PATH) // Avoid stack overflow in case of bad data; anything longer wouldn't work anyway.
+			{
+				LPTSTR buf = (LPTSTR)_alloca(sizeof(TCHAR) * (initial_dir_length + 1));
+				initial_dir = tmemcpy(buf, initial_dir, initial_dir_length);
+				buf[initial_dir_length] = '\0';
+			}
+			else
+				initial_dir = NULL;
+		}
 	}
 
 	TCHAR greeting[1024];
@@ -9646,7 +9660,7 @@ ResultType Line::FileSelectFile(LPTSTR aOptions, LPTSTR aWorkingDir, LPTSTR aGre
 	ofn.lpstrFile = file_buf;
 	ofn.nMaxFile = _countof(file_buf) - 1; // -1 to be extra safe.
 	// Specifying NULL will make it default to the last used directory (at least in Win2k):
-	ofn.lpstrInitialDir = *working_dir ? working_dir : NULL;
+	ofn.lpstrInitialDir = initial_dir;
 
 	// Note that the OFN_NOCHANGEDIR flag is ineffective in some cases, so we'll use a custom
 	// workaround instead.  MSDN: "Windows NT 4.0/2000/XP: This flag is ineffective for GetOpenFileName."
@@ -9800,10 +9814,9 @@ ResultType Line::FileSelectFile(LPTSTR aOptions, LPTSTR aWorkingDir, LPTSTR aGre
 
 
 
-// As of 2019-09-29, noinline reduces code size by over 20KB on VC++ 2019.
-// Prior to merging Util_CreateDir with this, it wasn't inlined.
-DECLSPEC_NOINLINE
-bool Line::FileCreateDir(LPTSTR aDirSpec, LPTSTR aCanModifyDirSpec)
+static bool FileCreateDirRecursive(LPTSTR aDirSpec);
+
+bool FileCreateDir(LPCTSTR aDirSpec)
 {
 	if (!aDirSpec || !*aDirSpec)
 	{
@@ -9811,6 +9824,26 @@ bool Line::FileCreateDir(LPTSTR aDirSpec, LPTSTR aCanModifyDirSpec)
 		return false;
 	}
 
+	// Make a modifiable copy to be used by recursive calls (supports long paths).
+	// Use GetFullPathName() instead of tmemcpy() or similar to normalize the path,
+	// which has at least two benefits:
+	//  1) Indirectly supports forward slash as a path separator.
+	//  2) Relative components such as "x\y\.." would otherwise cause the function
+	//     to report failure due to the order of checks and CreateDirectory calls.
+	TCHAR buf[T_MAX_PATH];
+	auto len = GetFullPathName(aDirSpec, _countof(buf), buf, nullptr);
+	if (!len || len >= _countof(buf))
+	{
+		if (len)
+			SetLastError(ERROR_BUFFER_OVERFLOW);
+		return false;
+	}
+
+	return FileCreateDirRecursive(buf);
+}
+
+static bool FileCreateDirRecursive(LPTSTR aDirSpec)
+{
 	DWORD attr = GetFileAttributes(aDirSpec);
 	if (attr != 0xFFFFFFFF)  // aDirSpec already exists.
 	{
@@ -9822,37 +9855,18 @@ bool Line::FileCreateDir(LPTSTR aDirSpec, LPTSTR aCanModifyDirSpec)
 	// to create this directory:
 	LPTSTR last_backslash = _tcsrchr(aDirSpec, '\\');
 	if (last_backslash > aDirSpec // v1.0.48.04: Changed "last_backslash" to "last_backslash > aDirSpec" so that an aDirSpec with a leading \ (but no other backslashes), such as \dir, is supported.
-		&& last_backslash[-1] != ':') // v1.1.31.00: Don't attempt FileCreateDir("C:") since that's equivalent to either "C:\" or the working directory (which already exists), or FileCreateDir("\\?\C:") since it always fails.
+		&& last_backslash[-1] != ':' // v1.1.31.00: Don't attempt FileCreateDir("C:") since that's equivalent to either "C:\" or the working directory (which already exists), or FileCreateDir("\\?\C:") since it always fails.
+		&& last_backslash[1]) // Skip the recursive call if it's just a trailing backslash.
 	{
-		LPTSTR parent_dir;
-		if (aCanModifyDirSpec)
-		{
-			parent_dir = aDirSpec; // Caller provided a modifiable aDirSpec.
-			*last_backslash = '\0'; // Temporarily terminate for parent directory.
-		}
-		else
-		{
-			// v1.1.31.00: Allocate a modifiable buffer to be used by all calls (supports long paths).
-			parent_dir = (LPTSTR)_alloca((last_backslash - aDirSpec + 1) * sizeof(TCHAR));
-			tcslcpy(parent_dir, aDirSpec, last_backslash - aDirSpec + 1); // Omits the last backslash.
-		}
-		bool exists = FileCreateDir(parent_dir, parent_dir); // Recursively create all needed ancestor directories.
-		if (aCanModifyDirSpec)
-			*last_backslash = '\\'; // Undo temporary termination.
-
-		// v1.0.44: Fixed ErrorLevel being set to 1 when the specified directory ends in a backslash.  In such cases,
-		// two calls were made to CreateDirectory for the same folder: the first without the backslash and then with
-		// it.  Since the directory already existed on the second call, ErrorLevel was wrongly set to 1 even though
-		// everything succeeded.  So now, when recursion finishes creating all the ancestors of this directory
-		// our own layer here does not call CreateDirectory() when there's a trailing backslash because a previous
-		// layer already did:
-		if (!last_backslash[1] || !exists)
+		*last_backslash = '\0'; // Temporarily terminate for parent directory.
+		auto exists = FileCreateDirRecursive(aDirSpec); // Recursively create all needed ancestor directories.
+		*last_backslash = '\\'; // Undo temporary termination.
+		if (!exists)
 			return exists;
 	}
 
 	// The above has recursively created all parent directories of aDirSpec if needed.
-	// Now we can create aDirSpec.  Be sure to explicitly set g_ErrorLevel since it's value
-	// is now indeterminate due to action above:
+	// Now we can create aDirSpec.
 	return CreateDirectory(aDirSpec, NULL);
 }
 
@@ -16983,6 +16997,8 @@ UINT_PTR CALLBACK RegisterCallbackCStub(UINT_PTR *params, char *address) // Used
 	}
 
 	g->EventInfo = cb.event_info; // This is the means to identify which caller called the callback (if the script assigned more than one caller to this callback).
+	
+	UINT_PTR number_to_return;
 
 	// For performance and to preserve stack space, the indirect method of calling a function via the new
 	// Func::Call overload is not used here.  Using it would only be necessary to support variadic functions,
@@ -16995,10 +17011,11 @@ UINT_PTR CALLBACK RegisterCallbackCStub(UINT_PTR *params, char *address) // Used
 	// 3) Script explicitly calls the UDF in addition to using it as a callback.
 	//
 	// See ExpandExpression() for detailed comments about the following section.
-	VarBkp *var_backup = NULL;  // If needed, it will hold an array of VarBkp objects.
-	int var_backup_count; // The number of items in the above array.
+	{// begin scope for call_info.
+	UDFCallInfo call_info;
+	call_info.func = &func;
 	if (func.mInstances > 0) // Backup is needed (see above for explanation).
-		if (!Var::BackupFunctionVars(func, var_backup, var_backup_count)) // Out of memory.
+		if (!Var::BackupFunctionVars(func, call_info.backup, call_info.backup_count)) // Out of memory.
 			return DEFAULT_CB_RETURN_VALUE; // Since out-of-memory is so rare, it seems justifiable not to have any error reporting and instead just avoid calling the function.
 
 	// The following section is similar to the one in ExpandExpression().  See it for detailed comments.
@@ -17028,13 +17045,15 @@ UINT_PTR CALLBACK RegisterCallbackCStub(UINT_PTR *params, char *address) // Used
 	g_script.mLastScriptRest = g_script.mLastPeekTime = GetTickCount(); // Somewhat debatable, but might help minimize interruptions when the callback is called via message (e.g. subclassing a control; overriding a WindowProc).
 
 	ExprTokenType result_token; // L31
+	DEBUGGER_STACK_PUSH(&call_info)
 	func.Call(&result_token); // Call the UDF.  Call()'s own return value (e.g. EARLY_EXIT or FAIL) is ignored because it wouldn't affect the handling below.
+	DEBUGGER_STACK_POP()
 
-	UINT_PTR number_to_return = (UINT_PTR)TokenToInt64(result_token); // L31: For simplicity, DEFAULT_CB_RETURN_VALUE is not used - DEFAULT_CB_RETURN_VALUE is 0, which TokenToInt64 will return if the token is empty.
+	number_to_return = (UINT_PTR)TokenToInt64(result_token); // L31: For simplicity, DEFAULT_CB_RETURN_VALUE is not used - DEFAULT_CB_RETURN_VALUE is 0, which TokenToInt64 will return if the token is empty.
 	if (result_token.symbol == SYM_OBJECT) // L31
 		result_token.object->Release();
 
-	Var::FreeAndRestoreFunctionVars(func, var_backup, var_backup_count); // ABOVE must be done BEFORE this because return_value might be the contents of one of the function's local variables (which are about to be free'd).
+	}// end scope for call_info; this is where Var::FreeAndRestoreFunctionVars() is called via ~UDFCallInfo().
 
 	if (cb.create_new_thread)
 	{
